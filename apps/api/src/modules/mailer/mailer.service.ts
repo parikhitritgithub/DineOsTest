@@ -1,11 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import { welcomeTemplate } from './templates/welcome.template';
 import { passwordResetTemplate } from './templates/password-reset.template';
 import { shiftSummaryTemplate } from './templates/shift-summary.template';
 import { billTemplate } from './templates/bill.template';
 import { trialExpiryTemplate } from './templates/trial-expiry.template';
+import { checkoutConfirmationTemplate } from './templates/checkout-confirmation.template';
+import { staffInviteTemplate } from './templates/staff-invite.template';
+import { subscriptionActivatedTemplate } from './templates/subscription-activated.template';
 
 export interface SendMailOptions {
   to: string | string[];
@@ -18,65 +21,48 @@ export interface SendMailOptions {
 @Injectable()
 export class MailerService {
   private readonly logger = new Logger(MailerService.name);
-  private transporter: nodemailer.Transporter | null = null;
+  private readonly resend: Resend;
   private readonly from: string;
-  private readonly enabled: boolean;
 
   constructor(private readonly config: ConfigService) {
-    this.from = config.get('SMTP_FROM', 'noreply@dinestay.app');
-    const host = config.get('SMTP_HOST');
-    const pass = config.get('SMTP_PASS');
-    this.enabled = !!(host && pass && pass !== 'xxxxx');
+    this.from = this.config.get<string>(
+      'EMAIL_FROM',
+      'onboarding@resend.dev',
+    );
 
-    if (this.enabled) {
-      this.transporter = nodemailer.createTransport({
-        host,
-        port: config.get<number>('SMTP_PORT', 587),
-        secure: config.get<number>('SMTP_PORT', 587) === 465,
-        auth: {
-          user: config.get('SMTP_USER', 'apikey'),
-          pass,
-        },
-        pool: true,
-        maxConnections: 5,
-        maxMessages: 100,
-      });
-      this.verifyConnection();
-    } else {
-      this.logger.warn('SMTP not configured — emails will be logged only');
-    }
-  }
+    const apiKey = this.config.get<string>('RESEND_API_KEY');
 
-  private async verifyConnection() {
-    try {
-      await this.transporter!.verify();
-      this.logger.log('SMTP connection verified');
-    } catch (err) {
-      this.logger.error('SMTP connection failed', err);
+    if (!apiKey) {
+      throw new Error('RESEND_API_KEY is missing');
     }
+
+    this.resend = new Resend(apiKey);
   }
 
   async send(options: SendMailOptions): Promise<boolean> {
-    const toList = Array.isArray(options.to) ? options.to.join(', ') : options.to;
-
-    if (!this.enabled || !this.transporter) {
-      this.logger.log(`[MAIL PREVIEW] To: ${toList} | Subject: ${options.subject}`);
-      return true;
-    }
-
     try {
-      const info = await this.transporter.sendMail({
+      const { error } = await this.resend.emails.send({
         from: this.from,
-        to: toList,
+        to: Array.isArray(options.to) ? options.to : [options.to],
         subject: options.subject,
         html: options.html,
-        text: options.text || options.html.replace(/<[^>]*>/g, ''),
-        attachments: options.attachments,
+        attachments: options.attachments?.map(a => ({
+          filename: a.filename,
+          content: typeof a.content === 'string'
+            ? a.content
+            : a.content.toString('base64'),
+        })),
       });
-      this.logger.log(`Email sent to ${toList} | messageId: ${info.messageId}`);
+
+      if (error) {
+        this.logger.error(error);
+        return false;
+      }
+
+      this.logger.log(`Email sent to ${options.to}`);
       return true;
     } catch (err) {
-      this.logger.error(`Failed to send email to ${toList}`, err);
+      this.logger.error(err);
       return false;
     }
   }
@@ -136,11 +122,13 @@ export class MailerService {
     sgst: number;
     igst: number;
     issuedAt: Date;
+    attachments?: Array<{ filename: string; content: Buffer | string; contentType?: string }>;
   }) {
     return this.send({
       to: opts.to,
       subject: `Your bill from ${opts.branchName} — ${opts.billNumber}`,
       html: billTemplate(opts),
+      attachments: opts.attachments,
     });
   }
 
@@ -149,6 +137,53 @@ export class MailerService {
       to: opts.to,
       subject: `Your Dine&Stay OS trial expires in 3 days`,
       html: trialExpiryTemplate(opts),
+    });
+  }
+
+  async sendCheckoutConfirmation(opts: {
+    to: string;
+    guestName: string;
+    roomNumber: string;
+    roomType: string;
+    checkInDate: string;
+    checkOutDate: string;
+    numNights: number;
+    totalAmount: number;
+    branchName: string;
+  }) {
+    return this.send({
+      to: opts.to,
+      subject: `Checkout Confirmation — ${opts.branchName}`,
+      html: checkoutConfirmationTemplate(opts),
+    });
+  }
+
+  async sendStaffInvite(opts: {
+    to: string;
+    employeeName: string;
+    role: string;
+    branchName: string;
+    businessName: string;
+  }) {
+    const appUrl = this.config.get('APP_URL', 'http://localhost:3001');
+    return this.send({
+      to: opts.to,
+      subject: `You've been added to ${opts.businessName} on Dine&Stay OS`,
+      html: staffInviteTemplate({ ...opts, loginLink: `${appUrl}/login` }),
+    });
+  }
+
+  async sendSubscriptionActivated(opts: {
+    to: string;
+    businessName: string;
+    planName: string;
+    priceMonthly: number;
+    nextBillingDate: Date;
+  }) {
+    return this.send({
+      to: opts.to,
+      subject: `Subscription Activated — ${opts.planName} plan`,
+      html: subscriptionActivatedTemplate(opts),
     });
   }
 }

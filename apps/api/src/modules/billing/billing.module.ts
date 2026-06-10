@@ -20,4 +20,4 @@ import { Plan } from '../subscriptions/entities/plan.entity';
   controllers: [BillingController],
   exports: [BillingService],
 })
-export class BillingModule {}
+export class BillingModule { }

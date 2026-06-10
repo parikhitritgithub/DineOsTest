@@ -1,13 +1,18 @@
-import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { Repository, DataSource, In } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import { User } from './entities/user.entity';
+import { MailerService } from '../mailer/mailer.service';
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     @InjectRepository(User) private readonly repo: Repository<User>,
+    private readonly dataSource: DataSource,
+    private readonly mailer: MailerService,
   ) { }
 
   findAll(tenantId: string, branchId?: string) {
@@ -69,6 +74,13 @@ export class UsersService {
       ...(pin !== undefined ? { pin } : {}),
     });
     await this.repo.save(user);
+
+    // Send staff invite email if user has an email (non-blocking)
+    if (user.email) {
+      this.sendStaffInviteEmail(user).catch((err) =>
+        this.logger.error(`Failed to send staff invite email: ${err.message}`),
+      );
+    }
 
     const { passwordHash: _ph, refreshToken: _rt, pin: _pin, ...safe } = user as any;
     return safe;
@@ -142,5 +154,34 @@ export class UsersService {
     const merged = { ...(user.permissions || {}), ...permissions };
     await this.repo.update(id, { permissions: merged });
     return this.findOne(id, tenantId);
+  }
+
+  // ── Email Helpers ──────────────────────────────────────────────────────────
+
+  private async sendStaffInviteEmail(user: User): Promise<void> {
+    // Fetch branch name
+    let branchName = 'Main Branch';
+    if (user.branchId) {
+      const [branch] = await this.dataSource.query(
+        `SELECT name FROM branches WHERE id = $1`,
+        [user.branchId],
+      );
+      branchName = branch?.name ?? branchName;
+    }
+
+    // Fetch tenant (business) name
+    const [tenant] = await this.dataSource.query(
+      `SELECT name FROM tenants WHERE id = $1`,
+      [user.tenantId],
+    );
+    const businessName = tenant?.name ?? 'Dine&Stay OS';
+
+    await this.mailer.sendStaffInvite({
+      to: user.email,
+      employeeName: `${user.firstName} ${user.lastName || ''}`.trim(),
+      role: user.role,
+      branchName,
+      businessName,
+    });
   }
 }

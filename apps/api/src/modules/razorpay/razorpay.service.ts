@@ -7,6 +7,7 @@ const Razorpay = require('razorpay');
 import { Subscription, SubscriptionStatus } from '../subscriptions/entities/subscription.entity';
 import { Plan } from '../subscriptions/entities/plan.entity';
 import { Tenant } from '../tenants/entities/tenant.entity';
+import { MailerService } from '../mailer/mailer.service';
 
 @Injectable()
 export class RazorpayService {
@@ -17,6 +18,7 @@ export class RazorpayService {
     @InjectRepository(Subscription) private readonly subRepo: Repository<Subscription>,
     @InjectRepository(Plan) private readonly planRepo: Repository<Plan>,
     @InjectRepository(Tenant) private readonly tenantRepo: Repository<Tenant>,
+    private readonly mailer: MailerService,
   ) {}
 
   private async getClientInfo(): Promise<{ client: any | null; webhookSecret: string; keyId: string }> {
@@ -125,7 +127,26 @@ export class RazorpayService {
 
     await this.subRepo.save(sub);
     this.logger.log(`Subscription activated for tenant ${opts.tenantId} — plan ${opts.planCode}`);
+
+    // Send subscription activation confirmation email (non-blocking)
+    this.sendActivationEmail(opts.tenantId, plan, sub.currentPeriodEnd).catch((err) =>
+      this.logger.error(`Failed to send activation email: ${err.message}`),
+    );
+
     return sub;
+  }
+
+  private async sendActivationEmail(tenantId: string, plan: Plan, nextBillingDate: Date): Promise<void> {
+    const tenant = await this.tenantRepo.findOne({ where: { id: tenantId } });
+    if (!tenant?.email) return;
+
+    await this.mailer.sendSubscriptionActivated({
+      to: tenant.email,
+      businessName: tenant.name,
+      planName: plan.name,
+      priceMonthly: Number(plan.priceMonthly),
+      nextBillingDate,
+    });
   }
 
   // ─── Process Razorpay webhooks ────────────────────────────────────────────

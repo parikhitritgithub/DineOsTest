@@ -1,8 +1,9 @@
-import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { Shift, ShiftStatus, ShiftDepartment } from './entities/shift.entity';
 import { ShiftDenomination } from './entities/shift-denomination.entity';
+import { MailerService } from '../mailer/mailer.service';
 
 export interface DenominationDto {
   note2000?: number; note500?: number; note200?: number; note100?: number;
@@ -12,6 +13,8 @@ export interface DenominationDto {
 
 @Injectable()
 export class ShiftsService {
+  private readonly logger = new Logger(ShiftsService.name);
+
   constructor(
     @InjectRepository(Shift)
     private readonly shiftRepo: Repository<Shift>,
@@ -19,6 +22,7 @@ export class ShiftsService {
     private readonly denomRepo: Repository<ShiftDenomination>,
     @InjectDataSource()
     private readonly db: DataSource,
+    private readonly mailer: MailerService,
   ) {}
 
   async openShift(
@@ -101,6 +105,11 @@ export class ShiftsService {
         this.denomRepo.create({ ...denominations, shiftId: shift.id, isOpening: false }),
       );
     }
+
+    // Send shift summary email to owner/manager (non-blocking)
+    this.sendShiftCloseEmail(shift).catch((err) =>
+      this.logger.error(`Failed to send shift summary email: ${err.message}`),
+    );
 
     return this.getShiftSummary(shift.id, tenantId);
   }
@@ -228,6 +237,57 @@ export class ShiftsService {
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────────
+
+  private async sendShiftCloseEmail(shift: Shift): Promise<void> {
+    // 1. Fetch branch name
+    const [branch] = await this.db.query(
+      `SELECT name FROM branches WHERE id = $1`,
+      [shift.branchId],
+    );
+    const branchName = branch?.name ?? 'Branch';
+
+    // 2. Fetch opener & closer names
+    const userIds = [shift.openedBy, shift.closedBy].filter(Boolean);
+    const users: Array<{ id: string; first_name: string; last_name: string | null }> =
+      userIds.length
+        ? await this.db.query(
+            `SELECT id, first_name, last_name FROM users WHERE id = ANY($1::uuid[])`,
+            [userIds],
+          )
+        : [];
+    const userMap = new Map(users.map((u) => [u.id, `${u.first_name} ${u.last_name || ''}`.trim()]));
+
+    // 3. Resolve email recipients: branch manager + owner
+    const recipients: Array<{ email: string }> = await this.db.query(
+      `SELECT DISTINCT email FROM users
+       WHERE tenant_id = $1 AND is_active = true
+         AND (role IN ('owner', 'manager')
+           OR (branch_id = $2 AND role IN ('restaurant_manager', 'hotel_manager')))
+         AND email IS NOT NULL`,
+      [shift.tenantId, shift.branchId],
+    );
+    const toEmails = recipients.map((r) => r.email).filter(Boolean);
+    if (!toEmails.length) return;
+
+    await this.mailer.sendShiftSummary({
+      to: toEmails,
+      branchName,
+      shiftNumber: shift.shiftNumber,
+      openedBy: userMap.get(shift.openedBy) ?? 'Unknown',
+      closedBy: userMap.get(shift.closedBy) ?? 'Unknown',
+      openedAt: shift.createdAt,
+      closedAt: shift.closedAt ?? new Date(),
+      totalSales: Number(shift.totalSales),
+      totalOrders: Number(shift.totalOrders),
+      cashSales: Number(shift.cashSales),
+      cardSales: Number(shift.cardSales),
+      upiSales: Number(shift.upiSales),
+      openingCash: Number(shift.openingCash),
+      closingCash: Number(shift.closingCash ?? 0),
+      expectedCash: Number(shift.expectedCash ?? 0),
+      cashDifference: Number(shift.cashDifference ?? 0),
+    });
+  }
 
   private async enrichShift(shift: Shift): Promise<any> {
   const userIds = [shift.openedBy, shift.closedBy].filter(Boolean);

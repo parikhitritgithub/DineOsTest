@@ -31,6 +31,7 @@ import {
 import { Payment, PaymentMethod } from "../billing/entities/payment.entity";
 import { Shift } from "../shifts/entities/shift.entity";
 import { ChannelManagerService } from "./channel-manager.service";
+import { MailerService } from "../mailer/mailer.service";
 import { forwardRef, Inject } from "@nestjs/common";
 
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
@@ -123,6 +124,7 @@ export class HotelService {
     private readonly paymentRepo: Repository<Payment>,
     @Inject(forwardRef(() => ChannelManagerService)) private readonly cmService: ChannelManagerService,
     private readonly dataSource: DataSource,
+    private readonly mailer: MailerService,
   ) { }
 
   // ── Room Types ──────────────────────────────────────────────────────────────
@@ -595,6 +597,9 @@ export class HotelService {
       });
       await em.save(task);
     });
+
+    // Send checkout confirmation email if guest has email (non-blocking)
+    this.sendCheckoutEmail(id, tenantId).catch(() => {});
 
     return this.getReservation(id, tenantId);
   }
@@ -1260,5 +1265,32 @@ export class HotelService {
       departuresToday,
       inHouse,
     };
+  }
+
+  // ── Email Helpers ──────────────────────────────────────────────────────────
+
+  private async sendCheckoutEmail(reservationId: string, tenantId: string): Promise<void> {
+    const reservation = await this.reservationRepo.findOne({
+      where: { id: reservationId, tenantId },
+      relations: ['room', 'room.roomType', 'primaryGuest'],
+    });
+    if (!reservation?.primaryGuest?.email) return;
+
+    const branch = await this.dataSource.query(
+      `SELECT name FROM branches WHERE id = $1`,
+      [reservation.branchId],
+    );
+
+    await this.mailer.sendCheckoutConfirmation({
+      to: reservation.primaryGuest.email,
+      guestName: reservation.primaryGuest.name,
+      roomNumber: reservation.room?.roomNumber ?? 'N/A',
+      roomType: reservation.room?.roomType?.name ?? 'Standard',
+      checkInDate: reservation.checkInDate,
+      checkOutDate: reservation.checkOutDate,
+      numNights: reservation.numNights,
+      totalAmount: Number(reservation.totalAmount),
+      branchName: branch?.[0]?.name ?? 'Our Hotel',
+    });
   }
 }
